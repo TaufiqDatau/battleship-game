@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 
 	"github.com/gorilla/websocket"
 )
@@ -21,11 +22,6 @@ type SentData struct {
 	Col       int    `json:"col"`
 }
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-}
-
 var enemyBoard = [10][10]int{
 	{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 	{0, 0, 0, 1, 0, 0, 0, 0, 0, 0},
@@ -38,6 +34,16 @@ var enemyBoard = [10][10]int{
 	{0, 0, 0, 0, 1, 0, 0, 0, 1, 0},
 	{0, 0, 0, 0, 1, 0, 0, 0, 1, 0},
 }
+
+var (
+	websocketMap = make(map[string]*websocket.Conn)
+	mutex        sync.Mutex // For safe concurrent access to websocketMap
+	upgrader     = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Allow all connections (be cautious in production)
+		},
+	}
+)
 
 func homePage(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Home Page")
@@ -53,10 +59,17 @@ func wsEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	log.Println("Client Connected")
 
-	reader(ws)
+	clientID := r.URL.Query().Get("id")
+
+	mutex.Lock()
+	websocketMap[clientID] = ws
+	mutex.Unlock()
+
+	reader(ws, clientID)
 }
 
-func reader(conn *websocket.Conn) {
+func reader(conn *websocket.Conn, clientID string) {
+	defer cleanupConnection(conn, clientID)
 	for {
 		// Read message from client
 		_, message, err := conn.ReadMessage()
@@ -86,10 +99,9 @@ func reader(conn *websocket.Conn) {
 				condition = "hit"
 			}
 
-			var responseData SentData = SentData{Condition: condition, Row: shot.Row, Col: shot.Col}
-			fmt.Println(responseData)
-			responseJSON, err := json.Marshal(responseData)
+			responseData := SentData{Condition: condition, Row: shot.Row, Col: shot.Col}
 
+			responseJSON, err := json.Marshal(responseData)
 			if err != nil {
 				log.Println("Error marshalling JSON:", err)
 				continue
@@ -100,9 +112,14 @@ func reader(conn *websocket.Conn) {
 				return
 			}
 		}
-
 	}
+}
 
+func cleanupConnection(conn *websocket.Conn, clientID string) {
+	defer conn.Close()
+	mutex.Lock()
+	defer mutex.Unlock()
+	delete(websocketMap, clientID)
 }
 
 func setupRoutes() {
