@@ -13,7 +13,7 @@ import (
 
 type GameRoom struct {
 	ID         string
-	Clients    map[*websocket.Conn]bool
+	Clients    map[*websocket.Conn]string
 	Broadcast  chan string
 	mu         sync.Mutex
 	MaxPlayers int
@@ -58,7 +58,7 @@ func (s *Server) JoinRoom(w http.ResponseWriter, r *http.Request) {
 	if !exists {
 		room = &GameRoom{
 			ID:         roomID,
-			Clients:    make(map[*websocket.Conn]bool),
+			Clients:    make(map[*websocket.Conn]string),
 			Broadcast:  make(chan string),
 			MaxPlayers: 2,
 		}
@@ -75,7 +75,7 @@ func (s *Server) JoinRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	room.Clients[conn] = true
+	room.Clients[conn] = generateClientID()
 	log.Printf("Player joined room %s", roomID)
 
 	go room.HandleClient(conn)
@@ -115,7 +115,7 @@ func (room *GameRoom) HandleClient(conn *websocket.Conn) {
 			return
 		}
 
-		room.Broadcast <- fmt.Sprintf("Room %s: %s", room.ID, string(msg))
+		room.Broadcast <- fmt.Sprintf("Player %s Room %s: %s", room.Clients[conn], room.ID, string(msg))
 	}
 }
 
@@ -125,6 +125,16 @@ func generateRoomID() string {
 	if err != nil {
 		log.Println("Error generating room ID:", err)
 		return "default-room" // Fallback room ID
+	}
+	return hex.EncodeToString(bytes)
+}
+
+func generateClientID() string {
+	bytes := make([]byte, 4) // 4 bytes = 8 hex characters
+	_, err := rand.Read(bytes)
+	if err != nil {
+		log.Println("Error generating client ID:", err)
+		return "default-client" // Fallback client ID
 	}
 	return hex.EncodeToString(bytes)
 }
