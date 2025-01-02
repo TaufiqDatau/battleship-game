@@ -1,7 +1,8 @@
 package main
 
 import (
-	"encoding/json"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,125 +11,129 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-type Shot struct {
-	Action string `json:"action"`
-	Row    int    `json:"row"`
-	Col    int    `json:"col"`
+type GameRoom struct {
+	ID         string
+	Clients    map[*websocket.Conn]bool
+	Broadcast  chan string
+	mu         sync.Mutex
+	MaxPlayers int
 }
 
-type SentData struct {
-	Condition string `json:"condition"`
-	Row       int    `json:"row"`
-	Col       int    `json:"col"`
+type Server struct {
+	Rooms map[string]*GameRoom
+	mu    sync.Mutex
 }
 
-var enemyBoard = [10][10]int{
-	{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-	{0, 0, 0, 1, 0, 0, 0, 0, 0, 0},
-	{0, 0, 0, 1, 0, 0, 0, 1, 1, 1},
-	{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-	{0, 1, 1, 1, 1, 0, 0, 0, 0, 0},
-	{0, 0, 0, 0, 0, 0, 1, 1, 0, 0},
-	{0, 0, 0, 0, 1, 0, 0, 0, 1, 0},
-	{0, 0, 0, 0, 1, 0, 0, 0, 1, 0},
-	{0, 0, 0, 0, 1, 0, 0, 0, 1, 0},
-	{0, 0, 0, 0, 1, 0, 0, 0, 1, 0},
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
 }
 
-var (
-	websocketMap = make(map[string]*websocket.Conn)
-	mutex        sync.Mutex // For safe concurrent access to websocketMap
-	upgrader     = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			return true // Allow all connections (be cautious in production)
-		},
+// NewGameServer creates a new server
+func NewGameServer() *Server {
+	return &Server{
+		Rooms: make(map[string]*GameRoom),
 	}
-)
-
-func homePage(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Home Page")
 }
 
-func wsEndpoint(w http.ResponseWriter, r *http.Request) {
-	upgrader.CheckOrigin = func(r *http.Request) bool { return true }
+// JoinRoom handles player connections to a room
+func (s *Server) JoinRoom(w http.ResponseWriter, r *http.Request) {
+	roomID := r.URL.Query().Get("room")
+	if roomID == "" {
+		// Generate a new room ID
+		roomID = generateRoomID()
+		http.Redirect(w, r, fmt.Sprintf("/join?room=%s", roomID), http.StatusFound)
+		return
+	}
 
-	ws, err := upgrader.Upgrade(w, r, nil)
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		fmt.Println(err)
+		log.Println("Upgrade error:", err)
+		return
 	}
 
-	log.Println("Client Connected")
+	s.mu.Lock()
+	room, exists := s.Rooms[roomID]
+	if !exists {
+		room = &GameRoom{
+			ID:         roomID,
+			Clients:    make(map[*websocket.Conn]bool),
+			Broadcast:  make(chan string),
+			MaxPlayers: 2,
+		}
+		s.Rooms[roomID] = room
+		go room.HandleMessages()
+	}
+	s.mu.Unlock()
 
-	clientID := r.URL.Query().Get("id")
+	room.mu.Lock()
+	defer room.mu.Unlock()
+	if len(room.Clients) >= room.MaxPlayers {
+		conn.WriteMessage(websocket.TextMessage, []byte("Room is full"))
+		conn.Close()
+		return
+	}
 
-	mutex.Lock()
-	websocketMap[clientID] = ws
-	mutex.Unlock()
+	room.Clients[conn] = true
+	log.Printf("Player joined room %s", roomID)
 
-	reader(ws, clientID)
+	go room.HandleClient(conn)
 }
 
-func reader(conn *websocket.Conn, clientID string) {
-	defer cleanupConnection(conn, clientID)
+// HandleMessages broadcasts messages to all clients in the room
+func (room *GameRoom) HandleMessages() {
 	for {
-		// Read message from client
-		_, message, err := conn.ReadMessage()
+		message := <-room.Broadcast
+		room.mu.Lock()
+		for client := range room.Clients {
+			log.Println()
+			err := client.WriteMessage(websocket.TextMessage, []byte(message))
+			if err != nil {
+				log.Println("Write error:", err)
+				client.Close()
+				delete(room.Clients, client)
+			}
+		}
+		room.mu.Unlock()
+	}
+}
+
+// HandleClient processes messages from a client
+func (room *GameRoom) HandleClient(conn *websocket.Conn) {
+	defer func() {
+		room.mu.Lock()
+		delete(room.Clients, conn)
+		room.mu.Unlock()
+		conn.Close()
+	}()
+
+	for {
+		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			log.Println("Error reading message:", err)
+			log.Println("Read error:", err)
 			return
 		}
 
-		// Convert message to string
-		messageStr := string(message)
-		fmt.Printf("Received message: %s\n", messageStr)
-
-		// Try to unmarshal the message into a Shot struct
-		var shot Shot
-		err = json.Unmarshal(message, &shot)
-		if err != nil {
-			log.Println("Error parsing JSON:", err)
-			continue // If it's not a valid shot JSON, keep waiting for the next message
-		}
-
-		// Handle the action (fire shot in this case)
-		if shot.Action == "fire_shot" {
-			log.Printf("Firing shot at row %d, col %d\n", shot.Row, shot.Col)
-
-			condition := "miss"
-			if enemyBoard[shot.Row][shot.Col] == 1 {
-				condition = "hit"
-			}
-
-			responseData := SentData{Condition: condition, Row: shot.Row, Col: shot.Col}
-
-			responseJSON, err := json.Marshal(responseData)
-			if err != nil {
-				log.Println("Error marshalling JSON:", err)
-				continue
-			}
-
-			if err := conn.WriteMessage(websocket.TextMessage, responseJSON); err != nil {
-				log.Println("Error sending message:", err)
-				return
-			}
-		}
+		room.Broadcast <- fmt.Sprintf("Room %s: %s", room.ID, string(msg))
 	}
 }
 
-func cleanupConnection(conn *websocket.Conn, clientID string) {
-	defer conn.Close()
-	mutex.Lock()
-	defer mutex.Unlock()
-	delete(websocketMap, clientID)
-}
-
-func setupRoutes() {
-	http.HandleFunc("/", homePage)
-	http.HandleFunc("/ws", wsEndpoint)
+func generateRoomID() string {
+	bytes := make([]byte, 4) // 4 bytes = 8 hex characters
+	_, err := rand.Read(bytes)
+	if err != nil {
+		log.Println("Error generating room ID:", err)
+		return "default-room" // Fallback room ID
+	}
+	return hex.EncodeToString(bytes)
 }
 
 func main() {
-	fmt.Println("Hello World")
-	setupRoutes()
+	server := NewGameServer()
+
+	http.HandleFunc("/join", server.JoinRoom)
+
+	log.Println("Server started on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
