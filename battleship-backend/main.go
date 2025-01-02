@@ -24,6 +24,10 @@ type Server struct {
 	mu    sync.Mutex
 }
 
+type Payload struct {
+	Action string `json:"action"`
+}
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true
